@@ -30,6 +30,8 @@ python3 server.py
 
 The server runs on port `5678` by default. Configure your reverse proxy (nginx, caddy, etc.) to forward WebSocket connections to this port.
 
+Copy `template.env` to `.env`. `REPORT_TOKEN` is the shared secret for status reports on WebSocket path `/report`. If it is missing or blank, `/report` does not exist (HTTP 404 before the handshake). A request is `{"type":"get_report","token":"..."}`.
+
 ## Auto-start
 
 ```bash

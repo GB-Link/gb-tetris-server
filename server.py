@@ -7,7 +7,9 @@
 
 print("Welcome to the Game Boy Online Server!")
 
+import hmac
 import json
+import os
 import uuid
 import asyncio
 import datetime
@@ -15,16 +17,37 @@ import random
 import websockets
 import string
 import ssl
+from http import HTTPStatus
+
+def _load_env(path=".env"):
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+_load_env()
+# Blank / missing / whitespace-only => report endpoint does not exist.
+REPORT_TOKEN = (os.getenv("REPORT_TOKEN") or "").strip()
+
 # Global scope #YOLO
 active_games = {
 }
 
 matchmaking_queue = []  # List of Client objects waiting for a match
+connected_clients = set()
+peak_player_count = 0
 
 # Because Python sucks
 class Game:
     pass
 import time
+
+SERVER_STARTED_AT = time.time()
 
 import logging
 class Client:
@@ -516,20 +539,159 @@ sockets = []
 
 games = {}
 
+_GAME_STATE_KEYS = {
+    Game.GAME_STATE_LOBBY: "lobby",
+    Game.GAME_STATE_RUNNING: "running",
+    Game.GAME_STATE_BETWEEN: "between",
+}
+
+def track_client(client):
+    global peak_player_count
+    connected_clients.add(client)
+    peak_player_count = max(peak_player_count, len(connected_clients))
+
+def untrack_client(client):
+    connected_clients.discard(client)
+
+async def release_client(client):
+    """Drop a client whose socket has closed, including a clean close."""
+    game = client.game
+    if game is None:
+        return
+    if client not in game.clients and client not in game.pending_clients:
+        return
+    if client in game.pending_clients:
+        game.pending_clients.remove(client)
+    await game.handle_client_disconnect(client)
+
+def build_report():
+    now = time.time()
+    by_state = {"lobby": 0, "running": 0, "between": 0}
+    private = 0
+    matchmaking = 0
+
+    for game in games.values():
+        if game.state == Game.GAME_STATE_FINISHED:
+            continue
+        if game.is_matchmaking:
+            matchmaking += 1
+        else:
+            private += 1
+        key = _GAME_STATE_KEYS.get(game.state)
+        if key:
+            by_state[key] += 1
+
+    return {
+        "type": "report",
+        "game": "tetris",
+        "ts": int(now),
+        "server_time": datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc).isoformat(),
+        "started_at": int(SERVER_STARTED_AT),
+        "uptime_seconds": int(now - SERVER_STARTED_AT),
+        "connected_players": len(connected_clients),
+        "peak_player_count": peak_player_count,
+        "matchmaking_waiting": len(matchmaking_queue),
+        "games": {
+            "total": private + matchmaking,
+            "private": private,
+            "matchmaking": matchmaking,
+            "by_state": by_state,
+        },
+    }
+
+def normalize_ws_path(path):
+    if not path:
+        return ""
+    return path.split("?", 1)[0].rstrip("/") or "/"
+
+def connection_path(websocket):
+    path = getattr(websocket, "path", None)
+    if path is None and hasattr(websocket, "request"):
+        path = getattr(websocket.request, "path", None)
+    return normalize_ws_path(path)
+
+def is_report_path(path):
+    return normalize_ws_path(path) == "/report"
+
+async def handle_report_message(websocket, msg):
+    if not REPORT_TOKEN:
+        try:
+            await websocket.close(1008, "Report disabled")
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        return
+
+    token = msg.get("token", "") if isinstance(msg, dict) else ""
+    if (
+        not isinstance(msg, dict)
+        or msg.get("type") != "get_report"
+        or not hmac.compare_digest(str(token), REPORT_TOKEN)
+    ):
+        try:
+            await websocket.send(json.dumps({
+                "type": "error",
+                "msg": "Unauthorized"
+            }))
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        return
+
+    try:
+        await websocket.send(json.dumps(build_report()))
+    except websockets.exceptions.ConnectionClosed:
+        pass
+
+async def handle_report(websocket):
+    try:
+        raw = await websocket.recv()
+        msg = json.loads(raw)
+    except (json.JSONDecodeError, websockets.exceptions.ConnectionClosed):
+        return
+    await handle_report_message(websocket, msg)
+
 def parse_register_msg(msg):
-    j = json.loads(msg)
-    if j["type"] != "register":
+    j = json.loads(msg) if isinstance(msg, str) else msg
+    if not isinstance(j, dict) or j.get("type") != "register":
         print("Not a registration message")
         return None
-    
+
     return j
 
+async def process_request(arg1, arg2):
+    """Reject /report before the handshake when REPORT_TOKEN is unset."""
+    if hasattr(arg2, "path"):
+        path = arg2.path
+        connection = arg1
+        if is_report_path(path) and not REPORT_TOKEN:
+            return connection.respond(HTTPStatus.NOT_FOUND, "Not Found")
+        return None
+
+    path = arg1
+    if is_report_path(path) and not REPORT_TOKEN:
+        return HTTPStatus.NOT_FOUND, [], b"Not Found\n"
+    return None
+
 async def newserver(websocket):
-    path = websocket.request.path  # Modern websockets API
+    path = connection_path(websocket)
+
+    if is_report_path(path):
+        await handle_report(websocket)
+        return
+
     print("Newserver")
-    # First wait for registration message.
-    # Without it we don't do anything.
-    msg = parse_register_msg(await websocket.recv())
+    # First message is either a report request or a player registration.
+    # get_report is accepted here because some proxies strip /report.
+    try:
+        raw = await websocket.recv()
+        first = json.loads(raw)
+    except (json.JSONDecodeError, websockets.exceptions.ConnectionClosed):
+        return
+
+    if isinstance(first, dict) and first.get("type") == "get_report":
+        await handle_report_message(websocket, first)
+        return
+
+    msg = parse_register_msg(first)
     if msg == None:
         error = {
             "type": "error",
@@ -540,9 +702,16 @@ async def newserver(websocket):
     name = msg["name"]
 
     print(f"New client with name: {name}")
-    
+
     # Next we create a client structure
     client = Client(websocket, name)
+    track_client(client)
+    try:
+        await _handle_client(websocket, path, client)
+    finally:
+        untrack_client(client)
+
+async def _handle_client(websocket, path, client):
     # Send uuid to client
     await client.send(json.dumps({
         "type": "user_info",
@@ -567,7 +736,8 @@ async def newserver(websocket):
             await client.process()
         except websockets.exceptions.ConnectionClosed:
             print(f"Client {client.name} disconnected from created game")
-            await new_game.handle_client_disconnect(client)
+        finally:
+            await release_client(client)
     # Or join an existing game
     elif(path.startswith("/join/")):
         game_name = path[6:].upper()
@@ -624,7 +794,8 @@ async def newserver(websocket):
             await client.process()
         except websockets.exceptions.ConnectionClosed:
             print(f"Client {client.name} disconnected")
-            await game.handle_client_disconnect(client)
+        finally:
+            await release_client(client)
     
     # Matchmaking
     elif(path == "/matchmake"):
@@ -672,7 +843,8 @@ async def newserver(websocket):
                 await client.process()
             except websockets.exceptions.ConnectionClosed:
                 print(f"Client {client.name} disconnected during matchmaking game")
-                await new_game.handle_client_disconnect(client)
+            finally:
+                await release_client(client)
         else:
             # Wait in queue until matched or cancelled
             print(f"{client.name} waiting in matchmaking queue (queue size: {len(matchmaking_queue)})")
@@ -721,8 +893,8 @@ async def newserver(websocket):
                     await client.process()
                 except websockets.exceptions.ConnectionClosed:
                     print(f"Client {client.name} disconnected during matchmaking game")
-                    if client.game:
-                        await client.game.handle_client_disconnect(client)
+                finally:
+                    await release_client(client)
 
         
     else:
@@ -731,7 +903,20 @@ async def newserver(websocket):
 
 
 async def main():
-    async with websockets.serve(newserver, '0.0.0.0', 5678, ping_interval=5, ping_timeout=5):
+    async with websockets.serve(
+        newserver,
+        "0.0.0.0",
+        5678,
+        ping_interval=5,
+        ping_timeout=5,
+        process_request=process_request,
+    ):
+        print("WebSocket server started on port 5678")
+        print(
+            "Report endpoint /report: enabled"
+            if REPORT_TOKEN
+            else "Report endpoint /report: not available (set REPORT_TOKEN)"
+        )
         await asyncio.get_running_loop().create_future()  # run forever
 
 asyncio.run(main())
